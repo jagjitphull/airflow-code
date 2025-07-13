@@ -1,4 +1,4 @@
-# dags/child_dag.py
+# dags/child_dag.py - need parent_dag.py also in same dag folder.
 from __future__ import annotations
 
 import pendulum
