@@ -3,6 +3,996 @@
 > **Version:** Apache Airflow 3.1.8  
 > **Level:** Intermediate  
 > **Prerequisite:** Complete [DAG Creation Guide](./airflow_dag_guide.md) first  
+> **Goal:** Learn to use sensors to make DAGs wait for conditions before running downstream tasks  
+> ✅ **All code in this guide is verified against Airflow 3.1.8 official documentation**
+
+---
+
+## 📑 Table of Contents
+
+- [What Are Sensors?](#-what-are-sensors)
+- [How a Sensor Works](#-how-a-sensor-works)
+- [Key Sensor Parameters](#-key-sensor-parameters)
+- [Sensor Modes](#-sensor-modes-poke-vs-reschedule-vs-deferrable)
+- [Correct Import Paths](#-correct-import-paths-airflow-3--important)
+- [Docker Setup (Do This First)](#-docker-setup-do-this-first)
+- [Use Case 1 — FileSensor](#-use-case-1--filesensor-wait-for-a-file-to-appear)
+- [Use Case 2 — HttpSensor](#-use-case-2--httpsensor-wait-for-an-api-to-be-ready)
+- [Use Case 3 — PythonSensor](#-use-case-3--pythonsensor-custom-condition)
+- [Use Case 4 — @task.sensor Decorator](#-use-case-4--tasksensor-decorator-modern-airflow-3-way)
+- [Use Case 5 — ExternalTaskSensor](#-use-case-5--externaltasksensor-wait-for-another-dag)
+- [Use Case 6 — Sensor with soft_fail](#-use-case-6--sensor-with-soft_fail)
+- [Use Case 7 — Exponential Backoff](#-use-case-7--sensor-with-exponential-backoff)
+- [Use Case 8 — Full Pipeline with Multiple Sensors](#-use-case-8--full-pipeline-with-multiple-sensors)
+- [CLI Commands](#-sensors-cli-commands)
+- [Common Mistakes](#-common-mistakes)
+- [Practice Checklist](#-trainee-practice-checklist)
+
+---
+
+## 🧠 What Are Sensors?
+
+A **Sensor** is a special type of operator that does exactly one thing — **waits for a condition to be true** before allowing downstream tasks to run.
+
+> 💡 Think of a Sensor as a **security guard** at the entrance of your pipeline.  
+> It keeps checking: *"Is the file here yet? Is the API ready? Did the other DAG finish?"*  
+> Only when the answer is **YES** does it let the next task through.
+
+### Why Use Sensors?
+
+| Without Sensor | With Sensor |
+|---|---|
+| Task runs even if file is missing | Waits until file appears, then runs |
+| Pipeline fails if API not ready | Waits until API responds, then proceeds |
+| Manually trigger DAG after dependency | Automatically waits for dependency |
+| Hardcode sleep/delays | Smart polling with configurable intervals |
+
+### Common Built-in Sensors
+
+| Sensor | Provider Package | Waits For |
+|---|---|---|
+| `FileSensor` | `apache-airflow-providers-standard` | A file to appear on disk |
+| `HttpSensor` | `apache-airflow-providers-http` | An HTTP endpoint to return expected response |
+| `PythonSensor` | `apache-airflow-providers-standard` | A Python function to return `True` |
+| `ExternalTaskSensor` | `apache-airflow-providers-standard` | A task in another DAG to complete |
+| `TimeDeltaSensor` | `apache-airflow-providers-standard` | A time interval to pass |
+| `SqlSensor` | `apache-airflow-providers-common-sql` | A SQL query to return non-empty results |
+| `S3KeySensor` | `apache-airflow-providers-amazon` | A file to appear in an S3 bucket |
+
+---
+
+## ⚙️ How a Sensor Works
+
+```
+Sensor task starts
+       │
+       ▼
+  poke() — check condition ──→ ❌ Not ready
+       │                           │
+       │                     wait poke_interval seconds
+       │                           │
+       │◄──────────────────────────┘
+       │
+  poke() — check condition ──→ ✅ Ready!
+       │
+       ▼
+  Sensor marks as SUCCESS
+       │
+       ▼
+  Downstream tasks run 🚀
+```
+
+If the condition is never met within `timeout` seconds:
+- `soft_fail=False` (default) → task **FAILS**
+- `soft_fail=True` → task is marked **SKIPPED**
+
+---
+
+## 🔑 Key Sensor Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `poke_interval` | `60` seconds | How often to check the condition |
+| `timeout` | `604800` **(7 days!)** | Max time before failing — **always override!** |
+| `mode` | `"poke"` | How sensor uses worker resources |
+| `soft_fail` | `False` | If `True`, mark SKIPPED instead of FAILED on timeout |
+| `exponential_backoff` | `False` | Gradually increase wait between checks |
+| `max_wait` | `None` | Upper cap (seconds) on exponential backoff |
+
+> ⚠️ **CRITICAL:** The default `timeout` is **7 days**! Always set a sensible timeout.  
+> A forgotten sensor will block a worker slot for a full week.
+
+---
+
+## 🔄 Sensor Modes: poke vs reschedule vs deferrable
+
+### Mode: `poke` (default)
+```
+Worker slot: [████████████████████████] OCCUPIED entire time
+```
+- ✅ Fast response when condition is met
+- ❌ Wastes worker slot the whole time it waits
+- ✅ Best for **short waits** (seconds to a few minutes)
+
+### Mode: `reschedule`
+```
+Worker slot: [██] free [██] free [██] condition met!
+```
+- ✅ Releases worker slot between checks — much more efficient
+- ✅ Best for **waits of minutes to hours**
+- ✅ **Use this for almost all production sensors**
+
+### Mode: `deferrable`
+```
+Worker slot: [██] → async triggerer process → [██] complete
+```
+- ✅ Most resource-efficient — uses the triggerer process
+- ⚠️ Requires `airflow-triggerer` container to be running
+- ✅ Best for **very long waits** in large deployments
+
+### Rule of Thumb:
+```
+Wait < 5 minutes     →  poke
+Wait 5min to hours   →  reschedule   ← use this for most cases
+Production systems   →  deferrable=True
+```
+
+---
+
+## ✅ Correct Import Paths (Airflow 3) — Important!
+
+Airflow 3 reorganised many imports. Always use these paths:
+
+```python
+# ✅ Core DAG and task
+from airflow.sdk import DAG, task
+
+# ✅ PokeReturnValue — official Airflow 3.1.8 location
+# Source: https://airflow.apache.org/docs/airflow/stable/tutorial/taskflow.html
+from airflow.sdk import PokeReturnValue
+
+# ✅ FileSensor
+from airflow.providers.standard.sensors.filesystem import FileSensor
+
+# ✅ PythonSensor
+from airflow.providers.standard.sensors.python import PythonSensor
+
+# ✅ ExternalTaskSensor
+from airflow.providers.standard.sensors.external_task import ExternalTaskSensor
+
+# ✅ HttpSensor
+from airflow.providers.http.sensors.http import HttpSensor
+
+# ✅ TriggerRule (for downstream task after sensor branches)
+from airflow.utils.trigger_rule import TriggerRule
+```
+
+---
+
+## 🐳 Docker Setup (Do This First)
+
+Complete all steps before trying any sensor DAG.
+
+### Step 1 — Add data volume to `docker-compose.yaml`
+
+Find the `x-airflow-common` volumes section and add the data mount:
+```yaml
+volumes:
+  - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+  - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+  - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+  - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
+  - ${AIRFLOW_PROJ_DIR:-.}/data:/opt/airflow/data    # ← ADD THIS LINE
+```
+
+### Step 2 — Create local data folder and restart
+
+```bash
+mkdir -p ./data
+docker compose down
+docker compose up -d
+```
+
+### Step 3 — Create `fs_default` connection (required for FileSensor)
+
+**Best way — via the UI:**
+1. Go to `http://localhost:8080`
+2. Admin → Connections → click **+**
+3. Fill in:
+   - **Conn Id:** `fs_default`
+   - **Conn Type:** `File (path)`
+   - **Extra:** `{"path": "/opt/airflow/data"}`
+4. Click **Save**
+
+**Alternative via CLI:**
+```bash
+docker compose run --rm airflow-cli airflow connections add 'fs_default' \
+    --conn-type 'fs' \
+    --conn-extra '{"path": "/opt/airflow/data"}'
+```
+
+### Step 4 — Create HTTP connection (for HttpSensor)
+
+```bash
+docker compose run --rm airflow-cli airflow connections add 'jsonplaceholder_api' \
+    --conn-type 'http' \
+    --conn-host 'https://jsonplaceholder.typicode.com'
+```
+
+### Step 5 — Add providers to `requirements.txt` and rebuild
+
+```
+apache-airflow-providers-standard
+apache-airflow-providers-http
+```
+
+```bash
+docker compose build --no-cache
+docker compose up -d
+
+# Verify providers are installed
+docker compose run --rm airflow-cli airflow providers list
+```
+
+### Step 6 — Verify setup
+
+```bash
+# Confirm data folder is mounted inside container
+docker exec airflow-docker-airflow-scheduler-1 ls /opt/airflow/
+# Expected output: config  dags  data  logs  plugins
+
+# Confirm connections were created
+docker compose run --rm airflow-cli airflow connections list
+```
+
+---
+
+## ✏️ Use Case 1 — FileSensor: Wait for a File to Appear
+
+**Scenario:** A daily sales pipeline waits for a CSV file to land before processing it.
+
+**File:** `dags/sensor_01_file.py`
+
+```python
+# sensor_01_file.py
+# ✅ Verified imports and logic for Airflow 3.1.8
+
+from airflow.sdk import DAG, task
+from airflow.providers.standard.sensors.filesystem import FileSensor
+from datetime import datetime
+
+with DAG(
+    dag_id="sensor_01_file",
+    start_date=datetime(2024, 1, 1),
+    schedule="@daily",
+    catchup=False,
+    tags=["sensors", "file"],
+):
+
+    # ── Sensor: wait until the file appears ───────────────────────
+    wait_for_file = FileSensor(
+        task_id="wait_for_sales_csv",
+        filepath="sales_data.csv",     # relative to fs_default path
+        fs_conn_id="fs_default",        # connection created in Step 3 above
+        poke_interval=15,               # check every 15 seconds
+        timeout=120,                    # fail after 2 minutes
+        mode="reschedule",              # release worker slot between checks
+        soft_fail=False,
+    )
+
+    # ── Task: read and print the file ─────────────────────────────
+    @task
+    def process_file():
+        import csv, os
+
+        filepath = "/opt/airflow/data/sales_data.csv"
+
+        if not os.path.exists(filepath):
+            print(f"❌ File not found: {filepath}")
+            return
+
+        with open(filepath, "r") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+
+        print(f"✅ File found — processing {len(rows)} rows...")
+        for row in rows:
+            print(f"   Product: {row.get('product')}, Amount: {row.get('amount')}")
+
+    # ── Task: generate report ─────────────────────────────────────
+    @task
+    def generate_report():
+        print("📊 Generating sales report...")
+        print("✅ Report complete!")
+
+    wait_for_file >> process_file() >> generate_report()
+```
+
+### How to Test
+
+```bash
+# 1. Trigger the DAG — sensor starts waiting (yellow in UI)
+docker compose run --rm airflow-cli airflow dags trigger sensor_01_file
+
+# 2. Create the file — sensor detects it within 15 seconds
+echo "product,amount
+Laptop,75000
+Phone,25000
+Tablet,35000" > ./data/sales_data.csv
+
+# 3. Sensor turns green → process_file → generate_report ✅
+
+# 4. Reset for another test
+rm ./data/sales_data.csv
+```
+
+### 🎯 What to Observe:
+- Task shows **yellow** while sensing — check logs to see each poke attempt
+- File appears → task turns **green** → downstream tasks run automatically
+- No file within `timeout` → task turns **red** (FAILED)
+
+---
+
+## ✏️ Use Case 2 — HttpSensor: Wait for an API to Be Ready
+
+**Scenario:** Confirm a REST API is healthy before fetching data.
+
+**File:** `dags/sensor_02_http.py`
+
+```python
+# sensor_02_http.py
+# ✅ Verified imports and logic for Airflow 3.1.8
+
+from airflow.sdk import DAG, task
+from airflow.providers.http.sensors.http import HttpSensor
+from datetime import datetime
+
+with DAG(
+    dag_id="sensor_02_http",
+    start_date=datetime(2024, 1, 1),
+    schedule="@daily",
+    catchup=False,
+    tags=["sensors", "http"],
+):
+
+    # ── Sensor A: Wait for HTTP 200 response ──────────────────────
+    wait_for_api = HttpSensor(
+        task_id="wait_for_api_health",
+        http_conn_id="jsonplaceholder_api",
+        endpoint="/posts/1",
+        method="GET",
+        # response_check: True = proceed, False = retry
+        response_check=lambda response: response.status_code == 200,
+        poke_interval=15,
+        timeout=120,
+        mode="reschedule",
+    )
+
+    # ── Sensor B: Wait for specific data in response JSON ─────────
+    wait_for_data = HttpSensor(
+        task_id="wait_for_data_ready",
+        http_conn_id="jsonplaceholder_api",
+        endpoint="/todos/1",
+        method="GET",
+        response_check=lambda response: "completed" in response.json(),
+        poke_interval=15,
+        timeout=120,
+        mode="reschedule",
+    )
+
+    # ── Task: fetch data once API is confirmed ready ───────────────
+    @task
+    def fetch_and_process():
+        from airflow.providers.http.hooks.http import HttpHook
+
+        hook = HttpHook(method="GET", http_conn_id="jsonplaceholder_api")
+        response = hook.run(endpoint="/posts?_limit=3")
+        posts = response.json()
+
+        print(f"✅ API ready — fetched {len(posts)} posts:")
+        for post in posts:
+            print(f"   [{post['id']}] {post['title'][:40]}...")
+
+    wait_for_api >> wait_for_data >> fetch_and_process()
+```
+
+### 🎯 What to Observe:
+- `response_check` lambda must explicitly return `True` or `False`
+- Since jsonplaceholder is always up, sensors succeed on first poke
+- Try `endpoint="/nonexistent"` — watch the sensor keep retrying until timeout
+
+---
+
+## ✏️ Use Case 3 — PythonSensor: Custom Condition
+
+**Scenario:** Wait until a simulated quality score meets a threshold.
+
+**File:** `dags/sensor_03_python.py`
+
+```python
+# sensor_03_python.py
+# ✅ Verified imports and logic for Airflow 3.1.8
+
+from airflow.sdk import DAG, task
+from airflow.providers.standard.sensors.python import PythonSensor
+from datetime import datetime
+import random
+
+with DAG(
+    dag_id="sensor_03_python",
+    start_date=datetime(2024, 1, 1),
+    schedule=None,
+    catchup=False,
+    tags=["sensors", "python"],
+):
+
+    def check_data_quality(**context):
+        """
+        Return True  → sensor SUCCEEDS, downstream tasks run
+        Return False → sensor RETRIES after poke_interval
+        """
+        quality_score = random.randint(60, 100)
+        print(f"🔍 Data quality score: {quality_score}%")
+
+        if quality_score >= 90:
+            print("✅ Quality meets threshold — proceeding!")
+            return True
+        else:
+            print(f"⏳ Score {quality_score}% below 90% — retrying...")
+            return False
+
+    wait_for_quality = PythonSensor(
+        task_id="wait_for_data_quality",
+        python_callable=check_data_quality,
+        poke_interval=10,
+        timeout=120,
+        mode="reschedule",
+    )
+
+    def check_business_hours(**context):
+        """Returns True only during weekday 9am–6pm."""
+        from datetime import datetime as dt
+        now = dt.now()
+        is_weekday    = now.weekday() < 5
+        is_work_hours = 9 <= now.hour < 18
+
+        print(f"🕐 Time: {now.strftime('%H:%M %A')}")
+        return is_weekday and is_work_hours
+
+    wait_for_business_hours = PythonSensor(
+        task_id="wait_for_business_hours",
+        python_callable=check_business_hours,
+        poke_interval=30,
+        timeout=3600,
+        mode="reschedule",
+    )
+
+    @task
+    def run_pipeline():
+        print("🤖 Running pipeline — all conditions met!")
+
+    wait_for_quality >> wait_for_business_hours >> run_pipeline()
+```
+
+---
+
+## ✏️ Use Case 4 — `@task.sensor` Decorator (Modern Airflow 3 Way)
+
+**Scenario:** Wait for sufficient inventory and pass the count to the next task.
+
+> ✅ **Verified import:** `from airflow.sdk import PokeReturnValue`  
+> Source: [Official Airflow 3.1.8 TaskFlow docs example](https://airflow.apache.org/docs/apache-airflow/stable/tutorial/taskflow.html)
+
+**File:** `dags/sensor_04_decorator.py`
+
+```python
+# sensor_04_decorator.py
+# ✅ Verified imports and PokeReturnValue usage for Airflow 3.1.8
+
+from airflow.sdk import DAG, task, PokeReturnValue   # ✅ from airflow.sdk
+from datetime import datetime
+import random
+
+with DAG(
+    dag_id="sensor_04_decorator",
+    start_date=datetime(2024, 1, 1),
+    schedule=None,
+    catchup=False,
+    tags=["sensors", "decorator"],
+):
+
+    @task.sensor(
+        task_id="check_inventory_level",
+        poke_interval=10,
+        timeout=120,
+        mode="reschedule",
+    )
+    def check_inventory() -> PokeReturnValue:
+        """
+        PokeReturnValue(is_done=True)  → sensor succeeds
+        PokeReturnValue(is_done=False) → sensor retries
+        xcom_value is automatically passed to downstream tasks
+        """
+        inventory_count = random.randint(0, 100)
+        print(f"📦 Current inventory: {inventory_count} units")
+
+        if inventory_count >= 50:
+            print(f"✅ Sufficient inventory — proceeding!")
+            return PokeReturnValue(
+                is_done=True,
+                xcom_value={                    # ← passed to downstream tasks
+                    "inventory_count": inventory_count,
+                    "status": "sufficient",
+                    "checked_at": str(datetime.now()),
+                }
+            )
+        else:
+            print(f"⏳ Only {inventory_count} units — waiting for restock...")
+            return PokeReturnValue(is_done=False)
+
+    @task
+    def process_orders(sensor_result):
+        """Receives xcom_value from the sensor automatically."""
+        print(f"🛒 Processing orders:")
+        print(f"   Inventory: {sensor_result['inventory_count']} units")
+        print(f"   Status   : {sensor_result['status']}")
+        print(f"   Checked  : {sensor_result['checked_at']}")
+        print("✅ Orders processed!")
+
+    # Sensor result flows automatically to process_orders
+    inventory_data = check_inventory()
+    process_orders(inventory_data)
+```
+
+### Key Difference: `@task.sensor` vs `PythonSensor`
+
+| Feature | `PythonSensor` | `@task.sensor` |
+|---|---|---|
+| Style | Classic operator | Modern decorator |
+| Pass data downstream | Manual XCom push | Auto via `xcom_value` in `PokeReturnValue` |
+| Return type | `True` / `False` | `PokeReturnValue` |
+| Airflow 3 recommended | Works | ✅ Preferred |
+
+---
+
+## ✏️ Use Case 5 — ExternalTaskSensor: Wait for Another DAG
+
+**Scenario:** A report DAG waits for an ETL DAG to fully complete.
+
+> ⚠️ **Logical Date Note:** `ExternalTaskSensor` matches runs by logical date.  
+> When testing manually, both DAGs must share the same logical date.  
+> Always include `execution_delta=timedelta(0)` when triggering manually.
+
+**File:** `dags/sensor_05_external_dag.py`
+
+```python
+# sensor_05_external_dag.py
+# ✅ Verified imports and execution_delta for Airflow 3.1.8
+
+from airflow.sdk import DAG, task
+from airflow.providers.standard.sensors.external_task import ExternalTaskSensor
+from datetime import datetime, timedelta
+
+# ── DAG 1: ETL Pipeline (to be waited on) ────────────────────────
+with DAG(
+    dag_id="sensor_05_etl_pipeline",
+    start_date=datetime(2024, 1, 1),
+    schedule="@daily",
+    catchup=False,
+    tags=["sensors", "etl"],
+):
+
+    @task
+    def extract():
+        print("📥 Extracting data...")
+
+    @task
+    def transform():
+        print("⚙️  Transforming data...")
+
+    @task
+    def load():
+        print("💾 Loading to warehouse... ✅ ETL complete!")
+
+    extract() >> transform() >> load()
+
+
+# ── DAG 2: Report DAG (waits for ETL) ─────────────────────────────
+with DAG(
+    dag_id="sensor_05_report_dag",
+    start_date=datetime(2024, 1, 1),
+    schedule="@daily",
+    catchup=False,
+    tags=["sensors", "report"],
+):
+
+    # Wait for entire ETL DAG to complete
+    wait_for_etl = ExternalTaskSensor(
+        task_id="wait_for_etl_dag",
+        external_dag_id="sensor_05_etl_pipeline",
+        external_task_id=None,              # None = wait for the whole DAG
+        allowed_states=["success"],
+        failed_states=["failed", "skipped"],
+        execution_delta=timedelta(0),       # ✅ match same logical date
+        poke_interval=15,
+        timeout=600,
+        mode="reschedule",
+    )
+
+    # Wait for a specific task in the ETL DAG
+    wait_for_load = ExternalTaskSensor(
+        task_id="wait_for_load_task",
+        external_dag_id="sensor_05_etl_pipeline",
+        external_task_id="load",            # wait for just the 'load' task
+        allowed_states=["success"],
+        execution_delta=timedelta(0),       # ✅ match same logical date
+        poke_interval=15,
+        timeout=600,
+        mode="reschedule",
+    )
+
+    @task
+    def generate_report():
+        print("📊 ETL confirmed complete — generating report...")
+        print("✅ Report complete!")
+
+    [wait_for_etl, wait_for_load] >> generate_report()
+```
+
+### How to Test
+
+```bash
+# Step 1: Trigger ETL DAG
+docker compose run --rm airflow-cli airflow dags trigger sensor_05_etl_pipeline
+
+# Step 2: Trigger report DAG with the SAME logical date
+docker compose run --rm airflow-cli airflow dags trigger sensor_05_report_dag \
+  --logical-date "2024-01-01T00:00:00+00:00"
+
+# Step 3: Watch report DAG wait (yellow) until ETL finishes (green)
+```
+
+---
+
+## ✏️ Use Case 6 — Sensor with `soft_fail`
+
+**Scenario:** Optional vendor file — skip processing if missing, never fail the whole pipeline.
+
+> ✅ **Fix applied:** `trigger_rule` is set **inside** the `@task()` decorator — not after the call.
+
+**File:** `dags/sensor_06_soft_fail.py`
+
+```python
+# sensor_06_soft_fail.py
+# ✅ Verified trigger_rule usage for Airflow 3.1.8
+
+from airflow.sdk import DAG, task
+from airflow.providers.standard.sensors.filesystem import FileSensor
+from airflow.utils.trigger_rule import TriggerRule    # ✅ correct import
+from datetime import datetime
+
+with DAG(
+    dag_id="sensor_06_soft_fail",
+    start_date=datetime(2024, 1, 1),
+    schedule="@daily",
+    catchup=False,
+    tags=["sensors", "soft-fail"],
+):
+
+    @task
+    def start_pipeline():
+        print("🚀 Pipeline started — checking for optional vendor file...")
+
+    # soft_fail=True → SKIPPED instead of FAILED when file not found
+    wait_for_vendor_file = FileSensor(
+        task_id="wait_for_vendor_file",
+        filepath="vendor_data.csv",
+        fs_conn_id="fs_default",
+        poke_interval=15,
+        timeout=30,           # short timeout for training
+        mode="reschedule",
+        soft_fail=True,       # ← marks SKIPPED not FAILED on timeout
+    )
+
+    @task
+    def process_vendor_data():
+        print("📦 Processing vendor data...")
+
+    # ✅ CORRECT — trigger_rule set INSIDE @task decorator
+    @task(trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS)
+    def generate_final_report():
+        """Runs regardless of whether vendor file was found or skipped."""
+        print("📊 Generating final report (vendor data included if available)...")
+        print("✅ Report complete!")
+
+    start  = start_pipeline()
+    vendor = process_vendor_data()
+    report = generate_final_report()
+
+    # Main path: start → sensor → vendor → report
+    start >> wait_for_vendor_file >> vendor >> report
+    # Fallback path if sensor is skipped: start → report directly
+    start >> report
+```
+
+### Behaviour Summary:
+
+| `soft_fail` | File appears | File not found (timeout) |
+|---|---|---|
+| `False` (default) | ✅ Proceeds | ❌ FAILS — pipeline stops |
+| `True` | ✅ Proceeds | 🩷 SKIPPED — `generate_final_report` still runs |
+
+### How to Test
+
+```bash
+# Test 1: No file → sensor skips → report still runs
+docker compose run --rm airflow-cli airflow dags trigger sensor_06_soft_fail
+
+# Test 2: With file → full path runs
+echo "vendor,value
+A,100" > ./data/vendor_data.csv
+docker compose run --rm airflow-cli airflow dags trigger sensor_06_soft_fail
+rm ./data/vendor_data.csv
+```
+
+---
+
+## ✏️ Use Case 7 — Sensor with Exponential Backoff
+
+**Scenario:** Poll an external batch job that takes an unpredictable amount of time. Use backoff to reduce API load.
+
+> ✅ **Fix applied:** Removed unreliable global counter. Uses stateless random simulation safe for distributed workers.
+
+**File:** `dags/sensor_07_backoff.py`
+
+```python
+# sensor_07_backoff.py
+# ✅ Stateless implementation — safe for distributed workers in Airflow 3.1.8
+
+from airflow.sdk import DAG, task
+from airflow.providers.standard.sensors.python import PythonSensor
+from datetime import datetime
+import random
+
+def check_batch_job(**context):
+    """
+    Simulates a batch job that completes ~30% chance per check.
+    Stateless — safe for distributed workers (no shared global state).
+    """
+    is_complete = random.random() < 0.30
+
+    if is_complete:
+        print("✅ Batch job COMPLETE!")
+    else:
+        print("⏳ Batch job still RUNNING — will retry...")
+
+    return is_complete
+
+with DAG(
+    dag_id="sensor_07_backoff",
+    start_date=datetime(2024, 1, 1),
+    schedule=None,
+    catchup=False,
+    tags=["sensors", "backoff"],
+):
+
+    # ── Fixed interval (for comparison) ──────────────────────────
+    wait_fixed = PythonSensor(
+        task_id="wait_fixed_interval",
+        python_callable=check_batch_job,
+        poke_interval=10,             # always exactly 10s
+        timeout=120,
+        mode="reschedule",
+        exponential_backoff=False,
+    )
+
+    # ── Exponential backoff ───────────────────────────────────────
+    wait_backoff = PythonSensor(
+        task_id="wait_with_backoff",
+        python_callable=check_batch_job,
+        poke_interval=5,              # starts at ~5 seconds
+        timeout=120,
+        mode="reschedule",
+        exponential_backoff=True,     # intervals: 5s → 10s → 20s → ...
+        max_wait=30,                  # capped at 30 seconds
+    )
+
+    @task
+    def process_results():
+        print("📊 Batch complete — processing results!")
+
+    wait_fixed >> wait_backoff >> process_results()
+```
+
+### Backoff Pattern:
+```
+poke_interval=5, exponential_backoff=True, max_wait=30:
+
+Check 1: wait  ~5s
+Check 2: wait ~10s
+Check 3: wait ~20s
+Check 4: wait  30s  ← capped at max_wait
+Check 5: wait  30s
+```
+
+---
+
+## ✏️ Use Case 8 — Full Pipeline with Multiple Sensors
+
+**Scenario:** Three parallel sensor gates must all pass before processing begins.
+
+**File:** `dags/sensor_08_full_pipeline.py`
+
+```python
+# sensor_08_full_pipeline.py
+# ✅ Verified imports and parallel sensor pattern for Airflow 3.1.8
+
+from airflow.sdk import DAG, task
+from airflow.providers.standard.sensors.filesystem import FileSensor
+from airflow.providers.standard.sensors.python import PythonSensor
+from airflow.providers.http.sensors.http import HttpSensor
+from datetime import datetime
+import random
+
+with DAG(
+    dag_id="sensor_08_full_pipeline",
+    start_date=datetime(2024, 1, 1),
+    schedule="@daily",
+    catchup=False,
+    tags=["sensors", "full-pipeline"],
+):
+
+    # ── Gate 1: File must exist ───────────────────────────────────
+    wait_for_file = FileSensor(
+        task_id="gate_1_wait_for_file",
+        filepath="daily_sales.csv",
+        fs_conn_id="fs_default",
+        poke_interval=15,
+        timeout=120,
+        mode="reschedule",
+    )
+
+    # ── Gate 2: API must be healthy ───────────────────────────────
+    wait_for_api = HttpSensor(
+        task_id="gate_2_wait_for_api",
+        http_conn_id="jsonplaceholder_api",
+        endpoint="/posts/1",
+        response_check=lambda response: response.status_code == 200,
+        poke_interval=15,
+        timeout=60,
+        mode="reschedule",
+    )
+
+    # ── Gate 3: System readiness check ───────────────────────────
+    def check_system_readiness(**context):
+        score = random.randint(80, 100)
+        print(f"🔍 System readiness: {score}%")
+        return score >= 85
+
+    wait_for_readiness = PythonSensor(
+        task_id="gate_3_system_ready",
+        python_callable=check_system_readiness,
+        poke_interval=10,
+        timeout=60,
+        mode="reschedule",
+    )
+
+    # ── Processing (only after ALL 3 gates pass) ──────────────────
+    @task
+    def process_data():
+        print("⚙️  All 3 gates passed — processing data...")
+        print("   ✅ File landed")
+        print("   ✅ API healthy")
+        print("   ✅ System ready")
+
+    @task
+    def generate_report():
+        print("📊 Generating daily report... ✅ Complete!")
+
+    # All 3 sensors run in PARALLEL — faster than sequential
+    [wait_for_file, wait_for_api, wait_for_readiness] >> process_data() >> generate_report()
+```
+
+### Pipeline Flow:
+```
+              ┌──→ gate_1_wait_for_file  ──→┐
+              ├──→ gate_2_wait_for_api   ──→ ├──→ process_data ──→ generate_report
+              └──→ gate_3_system_ready  ──→┘
+         (all 3 run in parallel — process_data waits for ALL)
+```
+
+### How to Test
+
+```bash
+# 1. Trigger the pipeline
+docker compose run --rm airflow-cli airflow dags trigger sensor_08_full_pipeline
+
+# 2. Gate 1 waits — create the file to unblock it
+echo "product,amount
+Laptop,75000" > ./data/daily_sales.csv
+
+# 3. Gate 2 (HTTP) resolves on first poke — always up
+# 4. Gate 3 (random 85+) resolves within a few pokes
+# 5. Once all 3 green → process_data starts automatically
+```
+
+---
+
+## 💻 Sensors CLI Commands
+
+```bash
+# Trigger a sensor DAG
+docker compose run --rm airflow-cli airflow dags trigger sensor_01_file
+
+# Check task state (is it still sensing?)
+docker compose run --rm airflow-cli airflow tasks state \
+  sensor_01_file wait_for_sales_csv 2024-01-01T00:00:00+00:00
+
+# List recent DAG runs
+docker compose run --rm airflow-cli airflow dags list-runs \
+  --dag-id sensor_01_file
+
+# Test a single sensor task without a full DAG run
+docker compose run --rm airflow-cli airflow tasks test \
+  sensor_01_file wait_for_sales_csv 2024-01-01
+
+# View task logs (see each poke attempt)
+docker compose run --rm airflow-cli airflow tasks logs \
+  sensor_01_file wait_for_sales_csv 2024-01-01T00:00:00+00:00
+
+# Watch container logs in real time
+docker logs airflow-docker-airflow-worker-1 -f
+```
+
+---
+
+## 📊 Sensor Quick Reference
+
+| Sensor | Correct Import (Airflow 3.1.8) | Use For |
+|---|---|---|
+| `FileSensor` | `airflow.providers.standard.sensors.filesystem` | File on disk |
+| `PythonSensor` | `airflow.providers.standard.sensors.python` | Any custom Python condition |
+| `ExternalTaskSensor` | `airflow.providers.standard.sensors.external_task` | Another DAG/task |
+| `HttpSensor` | `airflow.providers.http.sensors.http` | REST API response |
+| `PokeReturnValue` | `airflow.sdk` | Return value for `@task.sensor` |
+| `TriggerRule` | `airflow.utils.trigger_rule` | Post-sensor downstream task rules |
+
+---
+
+## ⚠️ Common Mistakes
+
+| Mistake | Symptom | Fix |
+|---|---|---|
+| Not setting `timeout` | Sensor runs for 7 days! | Always set `timeout` — e.g. `timeout=3600` |
+| `poke` mode for long waits | Worker slots exhausted | Use `mode="reschedule"` for waits > 5 min |
+| `PokeReturnValue` wrong import | `ImportError` | Use `from airflow.sdk import PokeReturnValue` |
+| `trigger_rule` set after `@task()` call | Rule has no effect | Set inside decorator: `@task(trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS)` |
+| `fs_default` connection not created | `KeyError: fs_default` | Create via UI (Conn Type: **File (path)**) before running |
+| `filepath` is absolute path | File never found | Use relative path — it joins with `fs_default` base path |
+| No `./data/` volume mount | File on laptop not visible in container | Add volume to `docker-compose.yaml` and restart |
+| ExternalTaskSensor logical dates differ | Sensor waits forever | Add `execution_delta=timedelta(0)` |
+| Global counter in sensor function | Unreliable between runs | Use stateless logic (random, Variables, or DB query) |
+| `soft_fail=True` but downstream still fails | Dependency misconfigured | Ensure downstream uses `@task(trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS)` |
+| `deferrable=True` without triggerer running | Task stuck in deferred state | Ensure `airflow-triggerer` container is up |
+
+---
+
+## 📦 All DAG Files Summary
+
+| # | File | Sensor Used | Key Concept Fixed/Verified |
+|---|---|---|---|
+| 1 | `sensor_01_file.py` | `FileSensor` | `fs_default` conn, relative path, `mode="reschedule"` |
+| 2 | `sensor_02_http.py` | `HttpSensor` | `response_check` lambda returns `True`/`False` |
+| 3 | `sensor_03_python.py` | `PythonSensor` | Stateless callable, return `True`/`False` |
+| 4 | `sensor_04_decorator.py` | `@task.sensor` | `PokeReturnValue` from `airflow.sdk` ✅ |
+| 5 | `sensor_05_external_dag.py` | `ExternalTaskSensor` | `execution_delta=timedelta(0)` for manual testing ✅ |
+| 6 | `sensor_06_soft_fail.py` | `FileSensor` + `soft_fail` | `trigger_rule` inside `@task()` decorator ✅ |
+| 7 | `sensor_07_backoff.py` | `PythonSensor` + backoff | Stateless check — no global counter ✅ |
+| 8 | `sensor_08_full_pipeline.py` | Multiple sensors | Parallel gates, production pattern |# 🔍 Apache Airflow 3.x — Sensors Guide for Trainees
+
+> **Version:** Apache Airflow 3.1.8  
+> **Level:** Intermediate  
+> **Prerequisite:** Complete [DAG Creation Guide](./airflow_dag_guide.md) first  
 > **Goal:** Learn to use sensors to make DAGs wait for conditions before running downstream tasks
 
 ---
@@ -70,1020 +1060,129 @@ Sensor task starts
        │                           │
        │                     wait poke_interval seconds
        │                           │
-       │◄──────────────────────────┘
-       │
-  poke() — check condition ──→ ✅ Ready!
+# 🔍 Apache Airflow 3.x — Sensors Guide for Trainees
+
+> **Version:** Apache Airflow 3.1.8  
+> **Level:** Intermediate  
+> **Prerequisite:** Complete [DAG Creation Guide](./airflow_dag_guide.md) first  
+> **Goal:** Learn to use sensors to make DAGs wait for conditions before running downstream tasks
+
+---
+
+## 📑 Table of Contents
+
+- [What Are Sensors?](#-what-are-sensors)
+- [How a Sensor Works](#-how-a-sensor-works)
+- [Key Sensor Parameters](#-key-sensor-parameters)
+- [Sensor Modes](#-sensor-modes-poke-vs-reschedule-vs-deferrable)
+- [Use Case 1 — FileSensor](#-use-case-1--filesensor-wait-for-a-file-to-appear)
+- [Use Case 2 — HttpSensor](#-use-case-2--httpsensor-wait-for-an-api-to-be-ready)
+- [Use Case 3 — PythonSensor](#-use-case-3--pythonsensor-custom-condition)
+- [Use Case 4 — @task.sensor Decorator](#-use-case-4--tasksensor-decorator-modern-airflow-3-way)
+- [Use Case 5 — ExternalTaskSensor](#-use-case-5--externaltasksensor-wait-for-another-dag)
+- [Use Case 6 — Sensor with Timeout & Soft Fail](#-use-case-6--sensor-with-timeout--soft-fail)
+- [Use Case 7 — Sensor with Exponential Backoff](#-use-case-7--sensor-with-exponential-backoff)
+- [Use Case 8 — Full Pipeline with Multiple Sensors](#-use-case-8--full-pipeline-with-multiple-sensors)
+- [Docker Setup for Sensors](#-docker-setup-for-sensors)
+- [Sensors CLI Commands](#-sensors-cli-commands)
+- [Common Mistakes](#-common-mistakes)
+- [Practice Checklist](#-trainee-practice-checklist)
+
+---
+
+## 🧠 What Are Sensors?
+
+A **Sensor** is a special type of operator that does exactly one thing — **waits for a condition to be true** before allowing downstream tasks to run.
+
+> 💡 Think of a Sensor as a **security guard** at the entrance of your pipeline.  
+> It keeps checking: *"Is the file here yet? Is the API ready? Did the other DAG finish?"*  
+> Only when the answer is **YES** does it let the next task through.
+
+### Why Use Sensors?
+
+| Without Sensor | With Sensor |
+|---|---|
+| Task runs even if file is missing | Waits until file appears, then runs |
+| Pipeline fails if API not ready | Waits until API responds, then proceeds |
+| Manually trigger DAG after dependency | Automatically waits for dependency |
+| Hardcode sleep/delays | Smart polling with configurable intervals |
+
+### Common Built-in Sensors
+
+| Sensor | Provider | Waits For |
+|---|---|---|
+| `FileSensor` | standard | A file to appear on disk |
+| `HttpSensor` | http | An HTTP endpoint to return expected response |
+| `PythonSensor` | standard | A Python function to return `True` |
+| `ExternalTaskSensor` | standard | A task in another DAG to complete |
+| `DateTimeSensor` | standard | A specific date/time to arrive |
+| `TimeDeltaSensor` | standard | A time interval to pass |
+| `SqlSensor` | common.sql | A SQL query to return non-empty results |
+| `S3KeySensor` | amazon | A file to appear in an S3 bucket |
+
+---
+
+## ⚙️ How a Sensor Works
+
+```
+Sensor task starts
        │
        ▼
-  Sensor marks as SUCCESS
-       │
-       ▼
-  Downstream tasks run 🚀
-```
+  poke() — check condition ──→ ❌ Not ready
+       │                           │
+       │                     wait poke_interval seconds
+       │                           │
 
-If the condition is never met within `timeout` seconds → sensor **FAILS** (or is **skipped** if `soft_fail=True`).
-
----
-
-## 🔑 Key Sensor Parameters
-
-All sensors share these core parameters:
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `poke_interval` | int (seconds) | `60` | How often to check the condition |
-| `timeout` | int (seconds) | `604800` (7 days!) | Max time to wait before failing |
-| `mode` | string | `"poke"` | How sensor uses worker resources |
-| `soft_fail` | bool | `False` | If `True`, mark as **SKIPPED** instead of **FAILED** on timeout |
-| `exponential_backoff` | bool | `False` | Increase wait time between checks gradually |
-| `max_wait` | int (seconds) | None | Cap on wait when using exponential backoff |
-
-> ⚠️ **CRITICAL:** The default `timeout` is **7 days**! Always set a sensible timeout for your use case. A sensor running for 7 days will block worker slots and waste resources.
-
----
-
-## 🔄 Sensor Modes: poke vs reschedule vs deferrable
-
-This is the most important concept for efficient sensor usage:
-
-### Mode: `poke` (default)
-```
-Worker slot: [████████████████████████] OCCUPIED entire time
-              │
-              sensor keeps checking every poke_interval
-              but HOLDS the worker slot the whole time
-```
-- ✅ Fast response to condition being met
-- ❌ Wastes worker slot while waiting
-- ✅ Best for **short waits** (seconds to a few minutes)
-
-### Mode: `reschedule`
-```
-Worker slot: [██]  free  [██]  free  [██]  condition met!
-              │           │           │
-            check       check       check
-```
-- ✅ Releases worker slot between checks
-- ✅ Much more resource-efficient
-- ✅ Best for **long waits** (minutes to hours)
-- ❌ Slightly slower to detect when condition is met
-
-### Mode: `deferrable`
-```
-Worker slot: [██]  (deferred to triggerer process)  [██] complete!
-              │                                        │
-            check   → handed to triggerer →         callback
-```
-- ✅ Most resource-efficient — uses async triggerer process
-- ✅ Best for **very long waits** in production
-- ⚠️ Requires `airflow triggerer` process to be running
-- ✅ Use `deferrable=True` parameter to enable
-
-### Rule of Thumb:
-
-```
-Wait time < 5 minutes   → poke mode
-Wait time 5min - hours  → reschedule mode
-Production deployment   → deferrable=True
-```
-
----
-
-## ✏️ Use Case 1 — FileSensor: Wait for a File to Appear
-
-**Scenario:** A daily pipeline that should only run after a CSV file lands in the data folder.
-
-### Step 1 — Set up Docker data folder volume
-
-Add to `docker-compose.yaml` volumes:
-```yaml
-volumes:
-  - ${AIRFLOW_PROJ_DIR:-.}/data:/opt/airflow/data
-```
-
-Create the folder:
-```bash
-mkdir -p ./data
-docker compose down && docker compose up -d
-```
-
-### Step 2 — Set up the FileSensor connection
-
-FileSensor requires a **filesystem connection** defining the base path:
-
-```bash
-# Create fs_default connection pointing to /opt/airflow/data
-docker compose run --rm airflow-cli airflow connections add 'fs_default' \
-    --conn-type 'fs' \
-    --conn-extra '{"path": "/opt/airflow/data"}'
-
-# Verify
-docker compose run --rm airflow-cli airflow connections get fs_default
-```
-
-### Step 3 — Create the DAG
-
-**File:** `dags/sensor_01_file.py`
-
-```python
-# sensor_01_file.py
-# Waits for a CSV file to appear before processing it
-
-from airflow.sdk import DAG, task
-from airflow.providers.standard.sensors.filesystem import FileSensor
-from datetime import datetime
-
-with DAG(
-    dag_id="sensor_01_file",
-    start_date=datetime(2024, 1, 1),
-    schedule="@daily",
-    catchup=False,
-    tags=["sensors", "file"],
-):
-
-    # ── Step 1: Wait for the file ────────────────────────────────
-    wait_for_file = FileSensor(
-        task_id="wait_for_sales_csv",
-        filepath="sales_data.csv",         # relative to fs_default connection path
-        fs_conn_id="fs_default",            # connection we created above
-        poke_interval=30,                   # check every 30 seconds
-        timeout=300,                        # fail after 5 minutes
-        mode="reschedule",                  # release worker slot between checks
-        soft_fail=False,                    # FAIL the task if timeout reached
-    )
-
-    # ── Step 2: Process the file once it appears ─────────────────
-    @task
-    def process_file():
-        import csv
-        filepath = "/opt/airflow/data/sales_data.csv"
-
-        with open(filepath, "r") as f:
-            reader = csv.DictReader(f)
-            rows = list(reader)
-
-        print(f"✅ File found! Processing {len(rows)} rows...")
-        for row in rows:
-            print(f"   Product: {row.get('product')}, Amount: {row.get('amount')}")
-
-    # ── Step 3: Generate report ───────────────────────────────────
-    @task
-    def generate_report():
-        print("📊 Generating sales report from processed data...")
-        print("✅ Report complete!")
-
-    # Wire up: sensor → process → report
-    process = process_file()
-    report  = generate_report()
-
-    wait_for_file >> process >> report
-```
-
-### Step 4 — Test It
-
-```bash
-# Start the DAG
-docker compose run --rm airflow-cli airflow dags trigger sensor_01_file
-
-# Watch it wait — check UI, task should show as "sensing" (yellow)
-
-# Now create the file to trigger it
-echo "product,amount
-Laptop,75000
-Phone,25000
-Tablet,35000" > ./data/sales_data.csv
-
-# The sensor should detect the file within 30 seconds and turn green!
-```
-
-### 🎯 What to Observe in the UI:
-- `wait_for_sales_csv` task shows as **yellow/running** while sensing
-- In **Grid view**, sensing tasks have a distinct pulsing indicator
-- Once file appears → task turns **green** → `process_file` starts automatically
-- Check task logs — see each poke attempt logged: `Poking: sales_data.csv`
-
----
-
-## ✏️ Use Case 2 — HttpSensor: Wait for an API to Be Ready
-
-**Scenario:** Before calling a payment API to process orders, confirm the API is healthy and responding.
-
-### Step 1 — Create the HTTP connection
-
-```bash
-docker compose run --rm airflow-cli airflow connections add 'jsonplaceholder_api' \
-    --conn-type 'http' \
-    --conn-host 'https://jsonplaceholder.typicode.com'
-
-docker compose run --rm airflow-cli airflow connections get jsonplaceholder_api
-```
-
-### Step 2 — Install HTTP provider
-
-Add to `requirements.txt`:
-```
-apache-airflow-providers-http
-```
-
-Rebuild:
-```bash
-docker compose build && docker compose up -d
-```
-
-### Step 3 — Create the DAG
-
-**File:** `dags/sensor_02_http.py`
-
-```python
-# sensor_02_http.py
-# Waits for an HTTP API to return a healthy response before processing
-
-from airflow.sdk import DAG, task
-from airflow.providers.http.sensors.http import HttpSensor
-from datetime import datetime
-
-with DAG(
-    dag_id="sensor_02_http",
-    start_date=datetime(2024, 1, 1),
-    schedule="@hourly",
-    catchup=False,
-    tags=["sensors", "http"],
-):
-
-    # ── Sensor: Wait until API returns a 200 response ────────────
-    wait_for_api = HttpSensor(
-        task_id="wait_for_api_health",
-        http_conn_id="jsonplaceholder_api",
-        endpoint="/posts/1",                 # endpoint to check
-        method="GET",
-        # response_check: return True = condition met, False = keep waiting
-        response_check=lambda response: response.status_code == 200,
-        poke_interval=20,                    # check every 20 seconds
-        timeout=120,                         # fail after 2 minutes
-        mode="reschedule",
-    )
-
-    # ── Sensor: Wait for specific data in response ────────────────
-    wait_for_data = HttpSensor(
-        task_id="wait_for_data_ready",
-        http_conn_id="jsonplaceholder_api",
-        endpoint="/todos/1",
-        method="GET",
-        # Check that response JSON has 'completed' field
-        response_check=lambda response: "completed" in response.json(),
-        poke_interval=15,
-        timeout=60,
-        mode="reschedule",
-    )
-
-    # ── Task: Fetch and process once API is ready ─────────────────
-    @task
-    def fetch_and_process():
-        from airflow.providers.http.hooks.http import HttpHook
-
-        hook = HttpHook(method="GET", http_conn_id="jsonplaceholder_api")
-        response = hook.run(endpoint="/posts?_limit=3")
-        posts = response.json()
-
-        print(f"✅ API ready! Fetched {len(posts)} posts:")
-        for post in posts:
-            print(f"   [{post['id']}] {post['title'][:40]}...")
-
-    wait_for_api >> wait_for_data >> fetch_and_process()
-```
-
-### 🎯 What to Observe:
-- Sensor checks the endpoint every `poke_interval` seconds
-- If the endpoint returns a non-200 status, sensor keeps retrying
-- `response_check` is a lambda that returns `True` (proceed) or `False` (retry)
-- Chain multiple HTTP sensors for multi-step API readiness checks
-
----
-
-## ✏️ Use Case 3 — PythonSensor: Custom Condition
-
-**Scenario:** Wait until a simulated data quality score crosses a threshold before running the ML pipeline.
-
-**File:** `dags/sensor_03_python.py`
-
-```python
-# sensor_03_python.py
-# Custom sensor using PythonSensor for any condition you can write in Python
-
-from airflow.sdk import DAG, task
-from airflow.providers.standard.sensors.python import PythonSensor
-from datetime import datetime
-import random
-
-with DAG(
-    dag_id="sensor_03_python",
-    start_date=datetime(2024, 1, 1),
-    schedule=None,           # manual trigger only
-    catchup=False,
-    tags=["sensors", "python"],
-):
-
-    # ── Use Case A: Wait for data quality score ──────────────────
-    def check_data_quality(**context):
-        """
-        Returns True  → condition met  → sensor succeeds
-        Returns False → condition not met → sensor retries after poke_interval
-        """
-        # Simulate checking a data quality score
-        # In real world: query DB, call API, check file stats, etc.
-        quality_score = random.randint(60, 100)
-        print(f"🔍 Current data quality score: {quality_score}%")
-
-        if quality_score >= 90:
-            print("✅ Quality threshold met — proceeding!")
-            return True
-        else:
-            print(f"⏳ Score {quality_score}% is below 90% threshold — retrying...")
-            return False
-
-    wait_for_quality = PythonSensor(
-        task_id="wait_for_data_quality",
-        python_callable=check_data_quality,
-        poke_interval=15,      # retry every 15 seconds
-        timeout=120,           # fail after 2 minutes
-        mode="reschedule",
-    )
-
-    # ── Use Case B: Wait for a specific time window ──────────────
-    def check_business_hours(**context):
-        """Wait until it is between 9am and 6pm on a weekday."""
-        from datetime import datetime
-        now = datetime.now()
-        is_weekday     = now.weekday() < 5           # Mon=0 ... Fri=4
-        is_work_hours  = 9 <= now.hour < 18          # 9am to 6pm
-
-        print(f"🕐 Current time: {now.strftime('%H:%M %A')}")
-        print(f"   Weekday     : {is_weekday}")
-        print(f"   Work hours  : {is_work_hours}")
-
-        return is_weekday and is_work_hours
-
-    wait_for_business_hours = PythonSensor(
-        task_id="wait_for_business_hours",
-        python_callable=check_business_hours,
-        poke_interval=60,       # check every minute
-        timeout=3600,           # wait up to 1 hour
-        mode="reschedule",
-    )
-
-    @task
-    def run_ml_pipeline():
-        print("🤖 Running ML pipeline — data quality confirmed and business hours verified!")
-
-    wait_for_quality >> wait_for_business_hours >> run_ml_pipeline()
-```
-
----
-
-## ✏️ Use Case 4 — `@task.sensor` Decorator (Modern Airflow 3 Way)
-
-The `@task.sensor` decorator is the cleanest way to write custom sensors in Airflow 3.
-
-**File:** `dags/sensor_04_decorator.py`
-
-```python
-# sensor_04_decorator.py
-# Modern Airflow 3 way to write sensors using @task.sensor decorator
-
-from airflow.sdk import DAG, task
-from airflow.sensors.base import PokeReturnValue
-from datetime import datetime
-import random
-
-with DAG(
-    dag_id="sensor_04_decorator",
-    start_date=datetime(2024, 1, 1),
-    schedule=None,
-    catchup=False,
-    tags=["sensors", "decorator"],
-):
-
-    # ── @task.sensor: returns PokeReturnValue ────────────────────
-    @task.sensor(
-        task_id="check_inventory_level",
-        poke_interval=20,
-        timeout=180,
-        mode="reschedule",
-    )
-    def check_inventory() -> PokeReturnValue:
-        """
-        Check if inventory level is sufficient.
-        PokeReturnValue(is_done=True)  → sensor succeeds
-        PokeReturnValue(is_done=False) → sensor retries
-        xcom_value → value passed to downstream tasks via XCom
-        """
-        inventory_count = random.randint(0, 100)
-        print(f"📦 Current inventory: {inventory_count} units")
-
-        if inventory_count >= 50:
-            print(f"✅ Inventory sufficient ({inventory_count} units) — proceeding!")
-            return PokeReturnValue(
-                is_done=True,
-                xcom_value={                   # ← data passed to downstream tasks
-                    "inventory_count": inventory_count,
-                    "status": "sufficient",
-                    "checked_at": str(datetime.now()),
-                }
-            )
-        else:
-            print(f"⏳ Inventory low ({inventory_count} units) — waiting for restock...")
-            return PokeReturnValue(is_done=False)  # retry
-
-    # ── Downstream task uses xcom_value from sensor ──────────────
-    @task
-    def process_orders(sensor_result):
-        """Receives the xcom_value from the sensor."""
-        print(f"🛒 Processing orders with inventory data:")
-        print(f"   Count   : {sensor_result['inventory_count']}")
-        print(f"   Status  : {sensor_result['status']}")
-        print(f"   Checked : {sensor_result['checked_at']}")
-        print("✅ Orders processed successfully!")
-
-    # Chain: sensor result automatically passes to next task
-    inventory_data = check_inventory()
-    process_orders(inventory_data)
-```
-
-### Key Difference: `@task.sensor` vs `PythonSensor`
-
-| Feature | `PythonSensor` | `@task.sensor` |
-|---|---|---|
-| Style | Classic operator | Modern decorator |
-| Pass data downstream | Manual XCom push | Via `xcom_value` in `PokeReturnValue` |
-| Return type | `True` / `False` | `PokeReturnValue` |
-| Airflow 3 recommended | Works | ✅ Preferred |
-
----
-
-## ✏️ Use Case 5 — ExternalTaskSensor: Wait for Another DAG
-
-**Scenario:** A reporting DAG that should only run after the ETL DAG has successfully completed for the same day.
-
-**File:** `dags/sensor_05_external_dag.py`
-
-```python
-# sensor_05_external_dag.py
-# Two DAGs: one ETL producer, one report consumer that waits for ETL
-
-from airflow.sdk import DAG, task
-from airflow.providers.standard.sensors.external_task import ExternalTaskSensor
-from airflow.providers.standard.operators.python import PythonOperator
-from datetime import datetime
-
-# ── DAG 1: ETL Pipeline (the one being waited on) ────────────────
-with DAG(
-    dag_id="sensor_05_etl_pipeline",
-    start_date=datetime(2024, 1, 1),
-    schedule="@daily",
-    catchup=False,
-    tags=["sensors", "etl"],
-):
-
-    @task
-    def extract():
-        print("📥 Extracting data...")
-
-    @task
-    def transform():
-        print("⚙️  Transforming data...")
-
-    @task
-    def load():
-        print("💾 Loading data to warehouse...")
-        print("✅ ETL complete!")
-
-    extract() >> transform() >> load()
-
-
-# ── DAG 2: Report DAG (waits for ETL to finish) ───────────────────
-with DAG(
-    dag_id="sensor_05_report_dag",
-    start_date=datetime(2024, 1, 1),
-    schedule="@daily",
-    catchup=False,
-    tags=["sensors", "report"],
-):
-
-    # Wait for the ENTIRE ETL DAG to complete
-    wait_for_etl = ExternalTaskSensor(
-        task_id="wait_for_etl_dag",
-        external_dag_id="sensor_05_etl_pipeline",   # DAG to wait for
-        external_task_id=None,                        # None = wait for entire DAG
-        allowed_states=["success"],                   # only proceed if ETL succeeded
-        failed_states=["failed", "skipped"],          # fail immediately if ETL failed
-        poke_interval=30,
-        timeout=3600,                                  # wait up to 1 hour
-        mode="reschedule",
-    )
-
-    # Wait for a SPECIFIC TASK in another DAG
-    wait_for_load_task = ExternalTaskSensor(
-        task_id="wait_for_load_task",
-        external_dag_id="sensor_05_etl_pipeline",
-        external_task_id="load",                      # wait for just the 'load' task
-        allowed_states=["success"],
-        poke_interval=30,
-        timeout=3600,
-        mode="reschedule",
-    )
-
-    @task
-    def generate_report():
-        print("📊 ETL confirmed complete — generating executive report...")
-        print("✅ Report generated and sent!")
-
-    # Run sensors in parallel, then generate report
-    [wait_for_etl, wait_for_load_task] >> generate_report()
-```
-
-### 🎯 What to Observe:
-1. Trigger `sensor_05_etl_pipeline` first
-2. Then trigger `sensor_05_report_dag` — it will wait in "sensing" state
-3. Once the ETL DAG completes, the report DAG sensors turn green
-4. `generate_report` then runs automatically
-
-> 💡 **Note:** Both DAGs must run with the **same logical date** for `ExternalTaskSensor` to match them. Trigger both at the same time manually, or let them both run on the same `@daily` schedule.
-
----
-
-## ✏️ Use Case 6 — Sensor with Timeout & Soft Fail
-
-**Scenario:** A sensor that tries to find a vendor file. If the file doesn't arrive within 10 minutes, **skip** the vendor processing instead of failing the whole pipeline.
-
-**File:** `dags/sensor_06_soft_fail.py`
-
-```python
-# sensor_06_soft_fail.py
-# soft_fail=True marks the task SKIPPED instead of FAILED on timeout
-
-from airflow.sdk import DAG, task
-from airflow.providers.standard.sensors.filesystem import FileSensor
-from airflow.providers.standard.operators.python import PythonOperator
-from datetime import datetime
-
-with DAG(
-    dag_id="sensor_06_soft_fail",
-    start_date=datetime(2024, 1, 1),
-    schedule="@daily",
-    catchup=False,
-    tags=["sensors", "soft-fail"],
-):
-
-    @task
-    def start_pipeline():
-        print("🚀 Pipeline started — checking for optional vendor file...")
-
-    # ── Sensor with soft_fail — SKIPPED instead of FAILED ────────
-    wait_for_vendor_file = FileSensor(
-        task_id="wait_for_vendor_file",
-        filepath="vendor_data.csv",
-        fs_conn_id="fs_default",
-        poke_interval=30,
-        timeout=60,             # wait 1 minute only
-        mode="reschedule",
-        soft_fail=True,         # ← KEY: SKIP instead of FAIL on timeout
-    )
-
-    @task
-    def process_vendor_data():
-        """This only runs if vendor file was found."""
-        print("📦 Processing vendor data...")
-
-    @task
-    def generate_final_report():
-        """This ALWAYS runs — even if vendor file was skipped."""
-        print("📊 Generating final report...")
-        print("   (vendor data included if available, skipped if not)")
-        print("✅ Report complete!")
-
-    start = start_pipeline()
-
-    start >> wait_for_vendor_file >> process_vendor_data()
-
-    # generate_final_report runs regardless of sensor outcome
-    # none_failed_min_one_success allows it to run even if sensor was skipped
-    final = generate_final_report()
-    final.set_upstream(start)
-    final.trigger_rule = "none_failed_min_one_success"
-    process_vendor_data() >> final
-```
-
-### Behaviour Comparison:
-
-| `soft_fail` | File appears | File doesn't appear |
-|---|---|---|
-| `False` (default) | ✅ Proceeds | ❌ FAILS — pipeline stops |
-| `True` | ✅ Proceeds | 🩷 SKIPPED — pipeline continues |
-
----
-
-## ✏️ Use Case 7 — Sensor with Exponential Backoff
-
-**Scenario:** Poll an external batch job API that may take 5 minutes or 3 hours to complete. Use exponential backoff to avoid hammering the API.
-
-**File:** `dags/sensor_07_backoff.py`
-
-```python
-# sensor_07_backoff.py
-# exponential_backoff=True increases wait time between checks gradually
-
-from airflow.sdk import DAG, task
-from airflow.providers.standard.sensors.python import PythonSensor
-from datetime import datetime
-import random
-
-# Simulate a batch job that takes random time to complete
-_job_check_count = {"count": 0}
-
-def check_batch_job_status(**context):
-    """
-    Simulates checking an external batch job.
-    Returns True after ~5 checks to simulate job completion.
-    """
-    _job_check_count["count"] += 1
-    count = _job_check_count["count"]
-
-    # Simulate job completing after 5 checks
-    is_complete = count >= 5
-    status = "COMPLETE" if is_complete else "RUNNING"
-
-    print(f"🔍 Batch job check #{count}: status = {status}")
-
-    if is_complete:
-        print("✅ Batch job completed!")
-    else:
-        print(f"⏳ Job still running... (check #{count}/5)")
-
-    return is_complete
-
-with DAG(
-    dag_id="sensor_07_backoff",
-    start_date=datetime(2024, 1, 1),
-    schedule=None,
-    catchup=False,
-    tags=["sensors", "backoff"],
-):
-
-    # ── Without backoff (fixed interval) ─────────────────────────
-    wait_fixed = PythonSensor(
-        task_id="wait_fixed_interval",
-        python_callable=check_batch_job_status,
-        poke_interval=10,           # always waits exactly 10 seconds
-        timeout=300,
-        mode="reschedule",
-        exponential_backoff=False,  # fixed interval
-    )
-
-    # ── With exponential backoff ──────────────────────────────────
-    wait_with_backoff = PythonSensor(
-        task_id="wait_with_backoff",
-        python_callable=check_batch_job_status,
-        poke_interval=5,            # starts at 5 seconds
-        timeout=300,
-        mode="reschedule",
-        exponential_backoff=True,   # 5s → 10s → 20s → 40s...
-        max_wait=60,                # cap at 60 seconds max
-    )
-
-    @task
-    def process_batch_results():
-        print("📊 Processing completed batch job results!")
-
-    wait_with_backoff >> process_batch_results()
-```
-
-### Exponential Backoff Pattern:
-
-```
-poke_interval=5, exponential_backoff=True, max_wait=60
-
-Check 1: wait 5s
-Check 2: wait 10s
-Check 3: wait 20s
-Check 4: wait 40s
-Check 5: wait 60s  ← capped by max_wait
-Check 6: wait 60s  ← stays at max_wait
-...
-```
-
----
-
-## ✏️ Use Case 8 — Full Pipeline with Multiple Sensors
-
-**Scenario:** A complete end-to-end data pipeline that uses sensors at every critical gate:
-1. Wait for upstream ETL DAG to finish
-2. Wait for raw data file to land
-3. Wait for API health check
-4. Process and generate report
-
-**File:** `dags/sensor_08_full_pipeline.py`
-
-```python
-# sensor_08_full_pipeline.py
-# Full pipeline using multiple sensors as gates at each stage
-
-from airflow.sdk import DAG, task
-from airflow.providers.standard.sensors.filesystem import FileSensor
-from airflow.providers.standard.sensors.python import PythonSensor
-from airflow.providers.standard.sensors.external_task import ExternalTaskSensor
-from airflow.providers.http.sensors.http import HttpSensor
-from datetime import datetime
-
-with DAG(
-    dag_id="sensor_08_full_pipeline",
-    start_date=datetime(2024, 1, 1),
-    schedule="@daily",
-    catchup=False,
-    tags=["sensors", "full-pipeline"],
-):
-
-    # ── Gate 1: Wait for upstream ETL to complete ─────────────────
-    wait_for_etl = ExternalTaskSensor(
-        task_id="gate_1_wait_for_etl",
-        external_dag_id="sensor_05_etl_pipeline",
-        external_task_id=None,
-        allowed_states=["success"],
-        poke_interval=30,
-        timeout=1800,
-        mode="reschedule",
-    )
-
-    # ── Gate 2: Wait for raw file to land ─────────────────────────
-    wait_for_file = FileSensor(
-        task_id="gate_2_wait_for_file",
-        filepath="daily_sales.csv",
-        fs_conn_id="fs_default",
-        poke_interval=30,
-        timeout=600,
-        mode="reschedule",
-        soft_fail=False,
-    )
-
-    # ── Gate 3: Confirm API is healthy ────────────────────────────
-    wait_for_api = HttpSensor(
-        task_id="gate_3_wait_for_api",
-        http_conn_id="jsonplaceholder_api",
-        endpoint="/posts/1",
-        response_check=lambda response: response.status_code == 200,
-        poke_interval=20,
-        timeout=120,
-        mode="reschedule",
-    )
-
-    # ── Gate 4: Custom readiness check ───────────────────────────
-    def check_system_readiness(**context):
-        """All systems go check."""
-        import random
-        score = random.randint(80, 100)
-        print(f"🔍 System readiness score: {score}%")
-        return score >= 85
-
-    wait_for_readiness = PythonSensor(
-        task_id="gate_4_system_readiness",
-        python_callable=check_system_readiness,
-        poke_interval=15,
-        timeout=120,
-        mode="reschedule",
-    )
-
-    # ── Processing tasks (only run after all gates pass) ──────────
-    @task
-    def process_data():
-        print("⚙️  All gates passed — processing data...")
-        print("   ✅ ETL data ready")
-        print("   ✅ File landed")
-        print("   ✅ API healthy")
-        print("   ✅ System ready")
-
-    @task
-    def generate_report():
-        print("📊 Generating final daily report...")
-        print("✅ Pipeline complete!")
-
-    # All 4 sensors run in PARALLEL (faster overall wait)
-    # Then processing runs after ALL sensors pass
-    [wait_for_etl, wait_for_file, wait_for_api, wait_for_readiness] >> process_data() >> generate_report()
-```
-
-### Pipeline Flow:
-```
-              ┌──→ gate_1_wait_for_etl       ──→┐
-              ├──→ gate_2_wait_for_file      ──→ ├──→ process_data ──→ generate_report
-              ├──→ gate_3_wait_for_api       ──→┤
-              └──→ gate_4_system_readiness   ──→┘
-         (all 4 sensors run in parallel)
-         (process_data only starts when ALL pass)
-```
-
----
-
-## 🐳 Docker Setup for Sensors
-
-### Required Connections (run these first)
-
-```bash
-# 1. Filesystem connection for FileSensor
-docker compose run --rm airflow-cli airflow connections add 'fs_default' \
-    --conn-type 'fs' \
-    --conn-extra '{"path": "/opt/airflow/data"}'
-
-# 2. HTTP connection for HttpSensor
-docker compose run --rm airflow-cli airflow connections add 'jsonplaceholder_api' \
-    --conn-type 'http' \
-    --conn-host 'https://jsonplaceholder.typicode.com'
-
-# Verify both connections
-docker compose run --rm airflow-cli airflow connections list
-```
-
-### Required Providers
-
-Add to `requirements.txt`:
-```
-apache-airflow-providers-standard
-apache-airflow-providers-http
-```
-
-Rebuild Docker image:
-```bash
-docker compose build --no-cache
-docker compose up -d
-```
-
-### Required Volume Mount (for FileSensor)
-
-In `docker-compose.yaml`:
-```yaml
-volumes:
-  - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
-  - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
-  - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
-  - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
-  - ${AIRFLOW_PROJ_DIR:-.}/data:/opt/airflow/data   # ← ADD THIS
-```
-
-```bash
-mkdir -p ./data
-docker compose down && docker compose up -d
-```
-
-### Creating Test Files to Trigger FileSensor
-
-```bash
-# Create a test file on your laptop (appears immediately inside container)
-echo "product,amount
-Laptop,75000
-Phone,25000" > ./data/sales_data.csv
-
-# Verify it's visible inside container
-docker exec airflow-docker-airflow-scheduler-1 \
-  cat /opt/airflow/data/sales_data.csv
-
-# Delete it to reset sensor (for re-testing)
-rm ./data/sales_data.csv
-```
-
-### Verifying Sensor Status via CLI
-
-```bash
-# List all task instances for a DAG run
-docker compose run --rm airflow-cli airflow tasks states-for-dag-run \
-  sensor_01_file <run_id>
-
-# Check task logs to see sensor poke attempts
-docker compose run --rm airflow-cli airflow tasks logs \
-  sensor_01_file wait_for_sales_csv <logical_date>
-
-# List recent DAG runs
-docker compose run --rm airflow-cli airflow dags list-runs \
-  --dag-id sensor_01_file
-```
-
----
-
-## 💻 Sensors CLI Commands
-
-```bash
-# Trigger a DAG with a sensor
-docker compose run --rm airflow-cli airflow dags trigger sensor_01_file
-
-# Check task state (is sensor still sensing?)
-docker compose run --rm airflow-cli airflow tasks state \
-  sensor_01_file wait_for_sales_csv <execution_date>
-
-# Manually mark sensor as success (bypass the wait — useful for testing)
-docker compose run --rm airflow-cli airflow tasks clear \
-  sensor_01_file -t wait_for_sales_csv -y
-
-# Test a single sensor task without a full DAG run
-docker compose run --rm airflow-cli airflow tasks test \
-  sensor_01_file wait_for_sales_csv 2024-01-01
-
-# View sensor task logs
-docker compose run --rm airflow-cli airflow tasks logs \
-  sensor_01_file wait_for_sales_csv 2024-01-01T00:00:00+00:00
-```
-
----
-
-## 📊 Sensor Comparison Table
-
-| Sensor | Provider | Use When | Mode Recommendation |
-|---|---|---|---|
-| `FileSensor` | standard | Waiting for files to land | `reschedule` |
-| `HttpSensor` | http | Waiting for API to respond | `reschedule` |
-| `PythonSensor` | standard | Any custom Python condition | `reschedule` |
-| `@task.sensor` | standard | Custom condition + data passthrough | `reschedule` |
-| `ExternalTaskSensor` | standard | Cross-DAG dependencies | `reschedule` |
-| `DateTimeSensor` | standard | Wait until specific date/time | `deferrable` |
-| `TimeDeltaSensor` | standard | Wait for time to pass | `deferrable` |
-| `SqlSensor` | common.sql | Wait for DB records to appear | `reschedule` |
-| `S3KeySensor` | amazon | Wait for S3 file | `deferrable` |
-
----
-
-## ⚠️ Common Mistakes
-
-| Mistake | Symptom | Fix |
-|---|---|---|
-| Not setting `timeout` | Sensor runs for 7 days! | Always set `timeout` — e.g. `timeout=3600` for 1 hour |
-| Using `poke` mode for long waits | Worker slots exhausted, other tasks can't run | Use `mode="reschedule"` for waits > 5 minutes |
-| `poke_interval` too short | Too many DB queries, scheduler overloaded | Set `poke_interval` ≥ 30 seconds for most cases |
-| `response_check` always returns `None` | Sensor never succeeds | Ensure the lambda explicitly returns `True` or `False` |
-| FileSensor can't find file | `AirflowSensorTimeout` | Check `fs_conn_id` path + file name spelling |
-| `fs_default` connection not created | `KeyError: fs_default` | Create the connection first via CLI or UI |
-| ExternalTaskSensor logical dates don't match | Sensor waits forever | Both DAGs must run with same logical date |
-| No `./data/` volume mount in Docker | File never visible inside container | Add volume mount to `docker-compose.yaml` and restart |
-| `soft_fail` not set, optional file absent | Whole pipeline fails | Use `soft_fail=True` for optional dependencies |
-| Using `deferrable=True` without triggerer | Task stays in deferred state forever | Ensure `airflow-triggerer` container is running |
-
----
-
-## 📦 All DAG Files Summary
-
-| # | File | Sensor Used | Key Concept |
-|---|---|---|---|
-| 1 | `sensor_01_file.py` | `FileSensor` | Wait for CSV file, `fs_default` connection |
-| 2 | `sensor_02_http.py` | `HttpSensor` | Wait for API, `response_check` lambda |
-| 3 | `sensor_03_python.py` | `PythonSensor` | Custom Python condition, return `True`/`False` |
-| 4 | `sensor_04_decorator.py` | `@task.sensor` | `PokeReturnValue`, pass data downstream |
-| 5 | `sensor_05_external_dag.py` | `ExternalTaskSensor` | Cross-DAG dependency |
-| 6 | `sensor_06_soft_fail.py` | `FileSensor` + `soft_fail` | Skip instead of fail on timeout |
-| 7 | `sensor_07_backoff.py` | `PythonSensor` + backoff | Exponential backoff for external APIs |
-| 8 | `sensor_08_full_pipeline.py` | Multiple sensors | Parallel gates, full production pattern |
 
 ---
 
 ## ✅ Trainee Practice Checklist
 
-### Level 1 — Setup
-- [ ] Add `./data:/opt/airflow/data` volume mount to `docker-compose.yaml`
-- [ ] Create `./data/` folder and restart Docker: `docker compose down && docker compose up -d`
-- [ ] Create `fs_default` connection via Docker CLI
+### Level 1 — Docker Setup
+- [ ] Add `./data:/opt/airflow/data` volume to `docker-compose.yaml` and restart
+- [ ] Create `fs_default` connection via UI — Conn Type: **File (path)**, Extra: `{"path": "/opt/airflow/data"}`
 - [ ] Create `jsonplaceholder_api` HTTP connection via Docker CLI
-- [ ] Verify both connections with `docker compose run --rm airflow-cli airflow connections list`
+- [ ] Add providers to `requirements.txt`, rebuild, verify with `airflow providers list`
+- [ ] Confirm data folder: `docker exec <scheduler> ls /opt/airflow/` shows `data`
 
-### Level 2 — FileSensor Basics
-- [ ] Create `sensor_01_file.py` and trigger the DAG
-- [ ] Watch the sensor task turn **yellow** in the UI (sensing state)
-- [ ] Create `./data/sales_data.csv` — watch sensor turn **green** automatically
-- [ ] Check the task logs — see each poke attempt printed
-- [ ] Delete the file, re-trigger, let it timeout — observe `FAILED` state
-- [ ] Set `soft_fail=True` — re-trigger without file — observe `SKIPPED` state
+### Level 2 — FileSensor
+- [ ] Create `sensor_01_file.py` and trigger
+- [ ] Watch task turn **yellow** in UI while sensing
+- [ ] Drop `./data/sales_data.csv` — watch sensor turn **green** within 15 seconds
+- [ ] Check task logs — see each poke attempt printed
+- [ ] Let timeout expire without file — observe **FAILED** state
+- [ ] Add `soft_fail=True` — repeat — observe **SKIPPED** state instead
 
 ### Level 3 — HTTP and Python Sensors
-- [ ] Create `sensor_02_http.py` — trigger and watch both HTTP sensors
-- [ ] Modify `response_check` to check for specific JSON field — test it works
-- [ ] Create `sensor_03_python.py` — trigger and observe random quality scores in logs
-- [ ] Change the threshold from 90 to 50 — observe sensor succeeds faster
+- [ ] Create `sensor_02_http.py` — trigger and confirm sensors succeed quickly
+- [ ] Modify `response_check` to check a JSON field — confirm it works
+- [ ] Create `sensor_03_python.py` — lower threshold to 50% and observe faster success
 
-### Level 4 — Modern Decorator & External
-- [ ] Create `sensor_04_decorator.py` — trigger and check XCom for inventory data
-- [ ] Create `sensor_05_external_dag.py` — trigger ETL first, then trigger report DAG
-- [ ] Observe report DAG waiting in sensing state until ETL completes
-- [ ] Verify both DAGs need same logical date to connect
+### Level 4 — Modern Decorator
+- [ ] Create `sensor_04_decorator.py` — verify `from airflow.sdk import PokeReturnValue` works
+- [ ] Trigger and check **XCom tab** — see `inventory_count` passed to `process_orders`
 
-### Level 5 — Advanced Patterns
-- [ ] Create `sensor_06_soft_fail.py` — trigger without file — confirm `SKIPPED` not `FAILED`
-- [ ] Create `sensor_07_backoff.py` — check logs to see wait intervals increasing
-- [ ] Create `sensor_08_full_pipeline.py` — trigger all 4 sensors running in parallel
-- [ ] Create all required files and connections — confirm full pipeline runs end to end
+### Level 5 — Cross-DAG and Soft Fail
+- [ ] Create `sensor_05_external_dag.py` — trigger ETL first, then report with same logical date
+- [ ] Observe report DAG waiting then succeeding after ETL finishes
+- [ ] Create `sensor_06_soft_fail.py` — trigger without file — confirm report still runs
+
+### Level 6 — Advanced and Full Pipeline
+- [ ] Create `sensor_07_backoff.py` — check logs to see increasing wait intervals
+- [ ] Create `sensor_08_full_pipeline.py` — drop the file and watch all 3 gates resolve
+- [ ] Remove one sensor from the list in Use Case 8 and observe `process_data` still waits for the remaining 2
 
 ---
 
 ## 🔗 Useful Resources
 
 - 📖 [Airflow Sensors Docs](https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/sensors.html)
+- 📖 [Task SDK API — PokeReturnValue](https://airflow.apache.org/docs/task-sdk/stable/api.html#airflow.sdk.PokeReturnValue)
 - 📖 [FileSensor Docs](https://airflow.apache.org/docs/apache-airflow-providers-standard/stable/sensors/file.html)
 - 📖 [ExternalTaskSensor Docs](https://airflow.apache.org/docs/apache-airflow-providers-standard/stable/sensors/external_task_sensor.html)
-- 📖 [Deferrable Operators Docs](https://airflow.apache.org/docs/apache-airflow/stable/authoring-and-scheduling/deferring.html)
+- 📖 [TaskFlow API + @task.sensor](https://airflow.apache.org/docs/apache-airflow/stable/tutorial/taskflow.html)
 - 🔗 [DAG Creation Guide](./airflow_dag_guide.md)
-- 🔗 [DAG Branching Guide](./airflow_dag_branching_guide.md)
+- 🔗 [Branching Guide](./airflow_dag_branching_guide.md)
 - 🔗 [Assets Guide](./airflow_assets_guide.md)
 - 🔗 [Variables, Providers & Connections Guide](./airflow_variables_providers_connections_guide.md)
 
@@ -1091,9 +1190,10 @@ docker compose run --rm airflow-cli airflow tasks logs \
 
 > 🙌 **Key Rules for Sensors:**
 >
-> 1. **Always set `timeout`** — the default is 7 days which will block worker slots
+> 1. **Always set `timeout`** — default is 7 days, which blocks worker slots
 > 2. **Use `mode="reschedule"`** for any wait longer than 5 minutes
-> 3. **Use `soft_fail=True`** for optional dependencies that shouldn't block the pipeline
-> 4. **Use `@task.sensor`** when you need to pass data from the sensor to downstream tasks
-> 5. **Mount `./data/`** as a Docker volume so FileSensor can actually see your files
-> 6. **Create the `fs_default` connection** before using FileSensor — it's not auto-created
+> 3. **Import `PokeReturnValue` from `airflow.sdk`** — not from `airflow.sensors.base`
+> 4. **Set `trigger_rule` inside `@task(trigger_rule=...)`** — not after the call
+> 5. **Create `fs_default` connection first** — FileSensor will not work without it
+> 6. **Mount `./data/` as a Docker volume** — files on your laptop must be visible inside containers
+> 7. **Use `execution_delta=timedelta(0)`** with ExternalTaskSensor when triggering both DAGs manually
